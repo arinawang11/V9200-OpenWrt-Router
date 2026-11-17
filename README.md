@@ -2,58 +2,70 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
-Turn a **ZTE V9200 (ZXRAN 5G BBU)** into a home/office software router.
+I turned a ZTE V9200 base station into a router. This repo is what I learned doing it, plus the scripts that ended up working.
 
-> Keeps the vendor kernel and system intact — no flashing, no repartitioning. OpenWrt runs as a Docker container on top of the vendor stack.
+The vendor kernel stays. No flashing, no repartitioning. OpenWrt runs in a Docker container on top of whatever ZTE shipped.
 
----
+## Why it's not just "install OpenWrt"
 
-## Why this project
+The kernel is built without `CONFIG_NETFILTER`. That means no iptables, no nftables, no connection tracking, no NAT. Not disabled, not missing a module. Never compiled in. You cannot fix this without a new kernel, and there is no new kernel.
 
-The V9200 is carrier-grade radio equipment with a completely closed software stack:
+So NAT has to happen in userspace. The kernel forwards packets, a process called `natd` rewrites them, and you spend a while convincing the two to cooperate.
 
-| Constraint | Detail |
-|---|---|
-| No netfilter in kernel | `CONFIG_NETFILTER is not set` — no iptables/nftables, **no kernel-space NAT** |
-| `/proc/sys` read-only in container | sysctls must be written from the host via `nsenter` |
-| BusyBox `ip` only | cannot create VLAN sub-interfaces inside the container |
-| Private middleware owns the NICs | `ice_sw` exposes 21 netdevs; Marvell chip driven by `HWM.EXE` via mmap |
-| LMT port has a destination whitelist | only `192.254.1.16` is reachable — address change, second IP, proxy ARP all fail |
+A few other things get in the way. `/proc/sys` is read-only inside the container, so sysctls have to be written from the host through `nsenter`. The container only has BusyBox `ip`, which can't create VLAN interfaces. The network cards are owned by ZTE middleware: `ice_sw` exposes 21 of them, and the Marvell chip is driven by `HWM.EXE` doing mmap directly, so Linux never sees it. And the LMT management port has a destination whitelist that only allows `192.254.1.16`.
 
-This project documents how to work around all of it: **NAT in userspace, kernel only forwards**.
+## The four things that cost me the most time
 
-## Key findings (read this first, saves days)
+### The WAN address has to be /32
 
-### 1. WAN address must be `/32` — `/24` is fatal
+I set it to /24 first, like you would on any normal Linux box. It worked, then everything broke after a few minutes: long-lived connections died, DNS went intermittent, SSH sessions dropped.
+
+The reason is that /24 makes the kernel add a connected route for the whole subnet. Now the upstream gateway counts as directly reachable. When natd rewrites an inbound packet and injects it, the kernel also has its own copy from the packet tap, decides the source is reachable, finds no matching socket, and sends an RST.
+
+With /32 there's no connected route, so inbound packets fall through to the default route on tun0 and `rp_filter=1` throws away the kernel's copy before local delivery. The tap still sees it first, which is all natd needs.
 
 ```sh
-ip addr add 203.0.113.10/24 dev eth16   # ✗ WRONG: creates a connected route
-ip addr add 203.0.113.10/32 dev eth16   # ✓ CORRECT
+ip addr add 203.0.113.10/24 dev eth16   # this is the one that breaks
+ip addr add 203.0.113.10/32 dev eth16   # this is the one that works
 ```
 
-Why: `/24` creates `203.0.113.0/24 dev eth16` as a connected route, which makes `rp_filter` accept packets sourced from the gateway. The kernel then sees NAT-returning packets as locally deliverable and answers with **RST** — every long-lived connection dies.
+You also have to drop `arp_ignore` to 1. The default of 2 means "only answer ARP if the target is inside one of my subnets", and a /32 address isn't inside any subnet, so the kernel stays silent.
 
-With `/32` there is no connected route → inbound packets fall through to `default dev tun0` → `rp_filter=1` drops the kernel's copy before local delivery, while the AF_PACKET tap still sees it.
+### natd has to go out through eth16.16, not eth16
 
-### 2. natd does not answer ARP requests
+Sending from `eth16` looks correct and gets you nothing. The CPU port has `pvid=100`, so any untagged frame natd emits gets classified into VLAN 100. The panel port is in VLAN 16, so the packet never arrives. The tell is that `ethtool -S eth16` shows `TX_BCST` stuck at zero while `nat.log` shows packets being sent.
 
-It only handles ARP *replies*. At cutover the upstream gateway still caches the old MAC — inbound traffic is black-holed for ~10 minutes. **You must send a GARP at cutover**; do not expect natd to do it.
+Create a VLAN subinterface on the host, give natd that as its WAN interface, and the frames carry a tag that the panel port strips on the way out.
 
-### 3. Missing `--static-ip` makes natd go fully silent
-
-In DHCP-client mode it never gets an address → `wan_ip==0` → the main loop counts every LAN-bound packet in `st_lan_rx` and drops it. This is the root cause of "not a single DNS query leaves the container".
-
-### 4. Panel business ports cannot be a second LAN port
-
-All four panel ports behave identically and none works. Either add a USB NIC or accept a single LAN + SSH tunnel.
-
-## Architecture
-
+```sh
+ip link add link eth16 name eth16.16 type vlan id 16
 ```
+
+This has to happen on the host. The container's BusyBox `ip` doesn't support it.
+
+### Without --static-ip, natd silently drops everything
+
+I left the flag off once and spent an hour on DNS. natd falls back to DHCP client mode, never gets a lease, and ends up with `wan_ip == 0`. The main loop then takes every packet headed for the LAN, increments `st_lan_rx`, and throws it away. No error, no log line that stands out, and `ip addr` still shows the address you added manually.
+
+### natd never answers ARP requests
+
+It handles replies only. At the moment you cut over, the upstream gateway still has the old device's MAC cached, so inbound traffic goes nowhere. I lost about fifteen minutes to this before realising nothing was coming back.
+
+Send a gratuitous ARP right after switching:
+
+```sh
+arping -U -c 3 -I eth16.16 -s 203.0.113.10 203.0.113.1
+```
+
+Don't try to solve this with proxy_arp and a route to lo. That pulls the kernel into the inbound path and breaks the /32 arrangement above.
+
+## How the pieces fit
+
+```sh
 LAN clients
    │  br-lan (192.168.10.1)
    ▼
-kernel forwarding (no CONFIG_NETFILTER — forward only)
+kernel forwarding (no netfilter, forward only)
    │  tun0 (169.254.255.1/30)
    ▼
 natd (userspace NAT, AF_PACKET tap)
@@ -62,57 +74,58 @@ natd (userspace NAT, AF_PACKET tap)
 upstream gateway
 ```
 
-| Component | Implementation | Notes |
-|---|---|---|
-| NAT | `natd` (C, 8.3M pkt/s) | default; `nat.py` 39k pkt/s as fallback |
-| VLAN sub-if | **host** creates `eth16.16` | container BusyBox `ip` cannot |
-| DHCP/DNS | dnsmasq 2.93, single config | no unbound |
-| Supervision | `watchdog.sh`, idempotent every 15s | auto-recovers after container rebuild |
-| Persistence | Docker volume `openwrt-data/_data` | survives container recreation |
+Outbound goes LAN, kernel forwards to tun0, natd reads from tun0, rewrites the source address and port, recomputes checksums, and injects on eth16.16. Inbound is the reverse: natd taps eth16.16, looks up the connection, restores the original destination, injects on tun0.
 
-## Quick start
+The container runs with `--network none`. Interfaces are moved in by hand. It sounds awkward but it keeps the container from fighting ZTE's middleware over the network stack, and it means the host keeps its management IP.
 
-Full guide: [`docs/deployment.md`](docs/deployment.md).
+Two interfaces worth knowing about: `veth-ow` to `veth-ow-c` is the only path between container and host, and `mv-ow` is a macvlan on the LMT port that gives the container a management address.
+
+The container has no procd. It's a bare rootfs, so there's no `service` anything. Everything is `nohup ... &`, and everything has to be restarted after a container rebuild. That's why `watchdog.sh` exists and why it does the same thing every 15 seconds instead of checking anything first. Every script involved is idempotent, so just running them again is the cheapest way to converge.
+
+## Getting it running
+
+The full version is in [docs/deployment.md](docs/deployment.md). The short version:
 
 ```sh
-# 1. Host: create the VLAN sub-interface
+# host: create the VLAN interface
 ip link add link eth16 name eth16.16 type vlan id 16
 ip link set eth16.16 up
 
-# 2. Deploy scripts into the volume
+# copy scripts into the volume
 cp scripts/*.sh /var/lib/docker/volumes/openwrt-data/_data/bin/
 
-# 3. Configure your network
+# your network goes here
 cp configs/v9200.env.example configs/v9200.env
 vi configs/v9200.env
 
-# 4. Bring it up
+# bring it up
 set -a; . configs/v9200.env; set +a
 sh scripts/setup-host.sh
 sh scripts/nat-up.sh
 ```
 
-## Documentation
+Then send the GARP. I mean it.
 
-| Doc | Contents |
-|---|---|
-| [docs/hardware.md](docs/hardware.md) | Ports, LEDs, cabling |
-| [docs/architecture.md](docs/architecture.md) | Container network stack and data plane |
-| [docs/natd-internals.md](docs/natd-internals.md) | natd reverse engineering: `/32` vs `/24`, rp_filter, ARP |
-| [docs/deployment.md](docs/deployment.md) | Step-by-step deploy and rollback |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Failure modes and how to diagnose them |
+## Docs
 
-## ⚠️ Security notes
+- [docs/hardware.md](docs/hardware.md): ports, LEDs, cabling
+- [docs/architecture.md](docs/architecture.md): how the stack is laid out
+- [docs/natd-internals.md](docs/natd-internals.md): the long version of everything above
+- [docs/deployment.md](docs/deployment.md): step by step, plus rollback
+- [docs/troubleshooting.md](docs/troubleshooting.md): what breaks and how to tell what broke
 
-- All IPs, MACs and hostnames in this repo are **examples** — replace them before deploying
-- The vendor OS stays in place, so **the vendor keeps remote management capability**. Do not use this if that matters to you
-- Back up the original partitions and config first
+## Before you deploy
 
-## Compatibility
+Every IP, MAC and hostname in this repo is a placeholder. Replace them.
 
-- Device: ZTE V9200 (ZXRAN 5G BBU), kernel 4.19.82-rt30, `ice_sw 0.15.0_rc5_33`
-- Other firmware versions may use different netdev names or `natd` flags — adapt accordingly
+The vendor OS is still there and still running. ZTE can still reach the device. If that's a problem for you, this whole approach is probably the wrong one.
+
+Back up the original partitions first.
+
+## Tested on
+
+ZTE V9200 (ZXRAN 5G BBU), kernel 4.19.82-rt30, `ice_sw 0.15.0_rc5_33`. Other firmware versions may name the interfaces differently or take different `natd` arguments.
 
 ## License
 
-MIT for documents and scripts. No vendor binaries, firmware, or decompilation output included.
+MIT, for the docs and scripts. Nothing here is ZTE's. There's no vendor binary, no firmware image, and no decompiled output.
