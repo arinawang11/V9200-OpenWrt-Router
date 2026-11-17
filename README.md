@@ -6,6 +6,45 @@ I turned a ZTE V9200 base station into a router. This repo is what I learned doi
 
 The vendor kernel stays. No flashing, no repartitioning. OpenWrt runs in a Docker container on top of whatever ZTE shipped.
 
+## The hardware, because it's the real reason to bother
+
+I'm running this on a **VSWD1**, the switch board that sits in slot 1 of the V9200 chassis. ZTE calls the V9200 a 5G BBU; the VSW is the board that does the switching and control.
+
+What's actually in there:
+
+- Intel Atom P5962B (Snow Ridge), **48 threads**
+- 16 GB RAM, 32 GB SSD, 2 GB boot flash
+- Intel Snow Ridge IES switching silicon, 21 netdevs hanging off it
+- An Intel QAT c4xxx crypto card with 128 VFs
+- 2×10G SFP, 2×QSFP, 1×RJ45 on the front panel
+- Dual power: 220V AC in slot 5, -48V DC in slot 13
+
+So you're getting a carrier switch with a 48-thread server CPU attached, for whatever a decommissioned BBU costs. A J4125 mini PC has 4 cores. Even a decent x86 soft router box has 8 or 16. This has 48 threads on an architecture built for packet processing, plus an actual switching ASIC so the CPU isn't doing the forwarding. Sitting behind gigabit, the CPU barely notices.
+
+Some specifics worth knowing:
+
+**The switch chip is real hardware forwarding.** Intel IES, not CPU-emulated. `eth20` is its 100G uplink to the CPU and it's up from boot. There are also 8 internal 10G SoC channels (`eth8`–`eth15`) that PTP-sync at startup — not exposed on the panel, but they're there.
+
+**The QAT card comes free.** ZTE uses the 128 VFs for 5G crypto. You won't. OpenWrt's `intel-qat` package works with it, so IPsec VPN gets hardware acceleration for nothing.
+
+**220V from a wall socket.** The chassis has both 220V AC and -48V DC power boards. Home use only needs the AC one. The -48V board sitting there with no light is normal, per the manual.
+
+**Fans and PSU take care of themselves.** Fan speed is hardware-controlled, full speed on reboot as a fail-safe, no software path. The power board has its own MCU protection. Neither needs anything from OpenWrt.
+
+But there are landmines:
+
+**There's a watchdog that will reboot you.** EPLD at `0xFE0BF000`, kick it by writing 0/1 alternately to `0xC8` every 500 ms, timer at `0xC4` (bit0 = armed). **127 minutes without a kick and the machine resets.** ZTE's own `watchdogfeed` process is retired and not running. If you port this to bare OpenWrt you have to kick it yourself.
+
+**Don't touch the Marvell chip.** `01:00.0`, `11ab:c81f`. No kernel driver; `HWM.EXE` owns it through DPDK. I read its BAR with raw devmem once — it hung the bus and reset the whole machine. Only reachable through HWM's post-init mmap.
+
+**No serial port located.** UEFI runs on `console=ttyS4,115200` but the physical header isn't exposed. USB-C is host-only (no typec/ccg/ucsi controller in dmesg), and DBG/LMT is pure Ethernet (1000BASE-T on all 8 pins). Probably a pin header on the board itself. Which means you currently can't get into the BIOS setup screen.
+
+**No RTC battery.** The chip works, but time is lost on power loss. NTP fixes it.
+
+**GNSS needs an antenna you don't have.** `/dev/pps0` actually comes from `ptp0` on the switch chip, not the GNSS module. With a powered antenna plus gpsd and chrony you could get timing back.
+
+Full details in [docs/hardware.md](docs/hardware.md).
+
 ## Why it's not just "install OpenWrt"
 
 The kernel is built without `CONFIG_NETFILTER`. That means no iptables, no nftables, no connection tracking, no NAT. Not disabled, not missing a module. Never compiled in. You cannot fix this without a new kernel, and there is no new kernel.
@@ -124,7 +163,9 @@ Back up the original partitions first.
 
 ## Tested on
 
-ZTE V9200 (ZXRAN 5G BBU), kernel 4.19.82-rt30, `ice_sw 0.15.0_rc5_33`. Other firmware versions may name the interfaces differently or take different `natd` arguments.
+ZTE VSWD1 switch board in a V9200 chassis (ZXRAN 5G BBU), kernel 4.19.82-rt30-CGELV7.01.80B2-intel-axxia-standard, `ice_sw 0.15.0_rc5_33`.
+
+Other board revisions or firmware versions may name the interfaces differently, take different `natd` arguments, or use a different watchdog offset. Check `dmesg` for the rename records before trusting any eth name in these docs.
 
 ## License
 
