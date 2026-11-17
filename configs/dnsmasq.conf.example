@@ -1,0 +1,59 @@
+# ==============================================================================
+# dnsmasq 一体配置（DHCP + DNS）
+# ------------------------------------------------------------------------------
+# 部署路径: <DATA>/etc/dnsmasq-lan.conf
+# 语法检查: dnsmasq --test -C /data/etc/dnsmasq-lan.conf
+# 拉起方式: 容器无 procd，需裸启动（见 scripts/dnsmasq-up.sh）
+# 注意    : 改完必须重启 dnsmasq 才生效
+#
+# 下面的 IP/MAC/主机名全部是示例，按你的网络替换
+# ==============================================================================
+
+# ---------- 监听接口 ----------
+interface=br-lan
+interface=mv-ow
+bind-interfaces
+
+# ---------- 上游 ----------
+no-resolv
+no-poll
+server=223.5.5.5
+server=119.29.29.29
+dns-forward-max=5000
+cache-size=10000
+
+# ---------- 本地域 ----------
+domain=internal
+local=/internal/
+local-ttl=3600
+no-ident
+host-record=router.internal,192.168.10.1
+host-record=localhost.internal,127.0.0.1
+
+# ---------- rebind 保护 ----------
+# 上游返回私网/环回/保留地址时丢弃答案
+stop-dns-rebind
+rebind-localhost-ok
+
+# ---------- DHCP ----------
+dhcp-authoritative
+dhcp-fqdn
+# 池 192.168.10.100 - 192.168.10.200（.1 = 网关）
+dhcp-range=interface:br-lan,192.168.10.100,192.168.10.200,255.255.255.0,86400
+# option 6 = 0.0.0.0：dnsmasq 替换成"收到该请求的接口地址"
+dhcp-option=6,0.0.0.0
+# option 42 = NTP
+dhcp-option=interface:br-lan,42,192.168.10.1
+# option 3（默认网关）不写：dnsmasq 默认就发接口地址
+
+# ---------- 静态绑定（示例，按需增删）----------
+# 格式: dhcp-host=<MAC>,<IP>,<主机名>
+# dhcp-host=aa:bb:cc:dd:ee:01,192.168.10.10,my-nas
+# dhcp-host=aa:bb:cc:dd:ee:02,192.168.10.11,my-pc
+
+# ---------- 租约与日志 ----------
+dhcp-leasefile=/data/etc/dnsmasq.leases
+dhcp-lease-max=300
+pid-file=/var/run/dnsmasq.pid
+log-dhcp
+log-facility=/data/logs/dnsmasq.log
